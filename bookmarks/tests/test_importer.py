@@ -3,7 +3,7 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from bookmarks.models import Bookmark, Tag, parse_tag_string
+from bookmarks.models import Bookmark, Tag, User, parse_tag_string
 from bookmarks.services import tasks
 from bookmarks.services.importer import ImportOptions, import_netscape_html
 from bookmarks.tests.helpers import (
@@ -12,7 +12,7 @@ from bookmarks.tests.helpers import (
     ImportTestMixin,
     disable_logging,
 )
-from bookmarks.utils import parse_timestamp
+from bookmarks.utils import normalize_url, parse_timestamp
 
 
 class ImporterTestCase(TestCase, BookmarkFactoryMixin, ImportTestMixin):
@@ -287,8 +287,9 @@ class ImporterTestCase(TestCase, BookmarkFactoryMixin, ImportTestMixin):
         import_html = self.render_html(tags=html_tags)
         import_netscape_html(import_html, self.get_or_create_test_user())
 
-        html_tags.append(BookmarkHtmlTag(href="https://example.com", tags="tag2, tag3"))
-        import_html = self.render_html(tags=html_tags)
+        import_html = self.render_html(
+            tags=[BookmarkHtmlTag(href="https://example.com", tags="tag2, tag3")]
+        )
         import_netscape_html(import_html, self.get_or_create_test_user())
 
         self.assertEqual(Bookmark.objects.count(), 1)
@@ -517,6 +518,156 @@ class ImporterTestCase(TestCase, BookmarkFactoryMixin, ImportTestMixin):
         self.assertEqual(Bookmark.objects.count(), 1)
         self.assertEqual(Bookmark.objects.all()[0].description, "Example description")
         self.assertEqual(Bookmark.objects.all()[0].notes, "Updated notes")
+
+    def test_REQ_1_import_matches_existing_bookmark_by_normalized_url(self):
+        user = self.get_or_create_test_user()
+        self.setup_bookmark(
+            user=user,
+            url="https://example.com",
+            title="Existing",
+        )
+        html_tags = [
+            BookmarkHtmlTag(
+                href="https://example.com/",
+                title="Imported title",
+                add_date="1",
+                last_modified="11",
+            ),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        result = import_netscape_html(import_html, user)
+
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.success, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(Bookmark.objects.filter(owner=user).count(), 1)
+
+    def test_REQ_2_import_updates_existing_bookmark_on_normalized_url_match(self):
+        user = self.get_or_create_test_user()
+        existing_tag = self.setup_tag(user=user, name="existing-tag")
+        self.setup_bookmark(
+            user=user,
+            url="https://example.org/search?a=1&b=2",
+            title="Old title",
+            description="Old description",
+            tags=[existing_tag],
+        )
+        html_tags = [
+            BookmarkHtmlTag(
+                href="https://example.org/search?b=2&a=1",
+                title="New title",
+                description="New description",
+                add_date="100",
+                last_modified="200",
+                tags="imported-tag",
+            ),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        import_netscape_html(import_html, user)
+
+        bookmark = Bookmark.objects.get(owner=user)
+        self.assertEqual(bookmark.url, "https://example.org/search?b=2&a=1")
+        self.assertEqual(bookmark.title, "New title")
+        self.assertEqual(bookmark.description, "New description")
+        tag_names = sorted(tag.name for tag in bookmark.tags.all())
+        self.assertEqual(tag_names, ["existing-tag", "imported-tag"])
+
+    def test_REQ_3_import_skips_later_in_file_duplicates_by_normalized_url(self):
+        user = self.get_or_create_test_user()
+        html_tags = [
+            BookmarkHtmlTag(
+                href="https://example.com/",
+                title="First title",
+                description="First description",
+                tags="first-tag",
+            ),
+            BookmarkHtmlTag(
+                href="https://example.com",
+                title="Second title",
+                description="Second description",
+                tags="second-tag",
+            ),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        import_netscape_html(import_html, user)
+
+        bookmark = Bookmark.objects.get(owner=user)
+        self.assertEqual(bookmark.title, "First title")
+        self.assertEqual(bookmark.description, "First description")
+        tag_names = [tag.name for tag in bookmark.tags.all()]
+        self.assertEqual(tag_names, ["first-tag"])
+
+    def test_REQ_4_import_counts_skipped_in_file_duplicates_as_failed(self):
+        user = self.get_or_create_test_user()
+        html_tags = [
+            BookmarkHtmlTag(href="https://example.com/a", title="A"),
+            BookmarkHtmlTag(href="https://example.com/b", title="B"),
+            BookmarkHtmlTag(href="https://example.com/a/", title="A duplicate"),
+            BookmarkHtmlTag(href="https://example.com/b/", title="B duplicate"),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        result = import_netscape_html(import_html, user)
+
+        self.assertEqual(result.total, 4)
+        self.assertEqual(result.success, 2)
+        self.assertEqual(result.failed, 2)
+        self.assertEqual(Bookmark.objects.filter(owner=user).count(), 2)
+
+    def test_REQ_5_import_normalized_match_only_considers_own_bookmarks(self):
+        owner = self.get_or_create_test_user()
+        other_user = User.objects.create_user("other", "other@example.com", "pass")
+        self.setup_bookmark(
+            user=other_user,
+            url="https://shared.example.com",
+            title="Other user bookmark",
+        )
+        html_tags = [
+            BookmarkHtmlTag(
+                href="https://shared.example.com/",
+                title="My import",
+                add_date="1",
+                last_modified="11",
+            ),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        import_netscape_html(import_html, owner)
+
+        self.assertEqual(Bookmark.objects.filter(owner=owner).count(), 1)
+        other_bookmark = Bookmark.objects.get(owner=other_user)
+        self.assertEqual(other_bookmark.title, "Other user bookmark")
+        self.assertEqual(other_bookmark.url, "https://shared.example.com")
+
+    def test_REQ_6_import_deduplicates_normalized_urls_across_batches(self):
+        user = self.get_or_create_test_user()
+        filler = [
+            BookmarkHtmlTag(
+                href=f"https://batch-filler.example.com/{index}",
+                title=f"Filler {index}",
+            )
+            for index in range(201)
+        ]
+        html_tags = [
+            BookmarkHtmlTag(
+                href="https://dup-across-batches.example.com/",
+                title="First occurrence",
+            ),
+            *filler,
+            BookmarkHtmlTag(
+                href="https://dup-across-batches.example.com",
+                title="Late duplicate",
+                tags="should-not-apply",
+            ),
+        ]
+        import_html = self.render_html(tags=html_tags)
+        result = import_netscape_html(import_html, user)
+
+        self.assertEqual(result.total, 203)
+        self.assertEqual(result.failed, 1)
+        dup_bookmark = Bookmark.objects.get(
+            url_normalized=normalize_url("https://dup-across-batches.example.com/")
+        )
+        self.assertEqual(dup_bookmark.title, "First occurrence")
+        self.assertEqual(list(dup_bookmark.tags.all()), [])
 
     def test_schedule_favicon_loading(self):
         user = self.get_or_create_test_user()
